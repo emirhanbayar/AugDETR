@@ -70,6 +70,9 @@ class DeformableTransformer(nn.Module):
                  embed_init_tgt=False,
 
                  use_detached_boxes_dec_out=False,
+
+                 use_hae=False,
+                 num_hybrid_layers=2,
                  ):
         super().__init__()
         self.num_feature_levels = num_feature_levels
@@ -108,6 +111,10 @@ class DeformableTransformer(nn.Module):
             encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
                                                           num_feature_levels, nhead, enc_n_points, add_channel_attention=add_channel_attention, use_deformable_box_attn=use_deformable_box_attn, box_attn_type=box_attn_type)
+            if use_hae:
+                hybrid_encoder_layer = HybridAttentionEncoderLayer(d_model, dim_feedforward,)
+            else:
+                hybrid_encoder_layer = None
         else:
             raise NotImplementedError
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
@@ -117,7 +124,9 @@ class DeformableTransformer(nn.Module):
             num_queries=num_queries,
             deformable_encoder=deformable_encoder, 
             enc_layer_share=enc_layer_share, 
-            two_stage_type=two_stage_type
+            two_stage_type=two_stage_type,
+            hybrid_encoder_layer=hybrid_encoder_layer,
+            num_hybrid_layers=num_hybrid_layers
         )
 
         # choose decoder layer type
@@ -439,11 +448,18 @@ class TransformerEncoder(nn.Module):
         deformable_encoder=False, 
         enc_layer_share=False, enc_layer_dropout_prob=None,                  
         two_stage_type='no',  # ['no', 'standard', 'early', 'combine', 'enceachlayer', 'enclayer1']
+        hybrid_encoder_layer=None,
+        num_hybrid_layers=2
     ):
         super().__init__()
         # prepare layers
         if num_layers > 0:
-            self.layers = _get_clones(encoder_layer, num_layers, layer_share=enc_layer_share)
+            if hybrid_encoder_layer is not None:
+                self.layers = _get_clones(hybrid_encoder_layer, num_hybrid_layers)
+                assert num_layers > num_hybrid_layers
+                self.layers += _get_clones(encoder_layer, num_layers - num_hybrid_layers, layer_share=enc_layer_share)
+            else:
+                self.layers = _get_clones(encoder_layer, num_layers, layer_share=enc_layer_share)
         else:
             self.layers = []
             del encoder_layer
@@ -1062,7 +1078,59 @@ def build_deformable_transformer(args):
         module_seq=args.decoder_module_seq,
 
         embed_init_tgt=args.embed_init_tgt,
-        use_detached_boxes_dec_out=use_detached_boxes_dec_out
+        use_detached_boxes_dec_out=use_detached_boxes_dec_out,
+
+        use_hae=args.use_hae,
+        num_hybrid_layers=args.num_hybrid_layers,
     )
 
+class HybridAttentionEncoderLayer(DeformableTransformerEncoderLayer):
+    def __init__(self,
+                 d_model=256, d_ffn=1024,
+                 dropout=0.1, activation="relu",
+                 n_levels=4, n_heads=8, n_points=4,
+                 add_channel_attention=False,
+                 use_deformable_box_attn=False,
+                 box_attn_type='roi_align'):
+        super().__init__(d_model, d_ffn, dropout, activation, 
+                        n_levels, n_heads, n_points,
+                        add_channel_attention, use_deformable_box_attn, 
+                        box_attn_type)
+        
+        # Add standard self-attention for P5 features
+        self.std_self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.dropout_std = nn.Dropout(dropout)
+        self.norm_std = nn.LayerNorm(d_model)
 
+    def forward(self, src, pos, reference_points, spatial_shapes, level_start_index, key_padding_mask=None):
+
+        p5_start = level_start_index[-1]
+        p5_src = src[:, p5_start:]
+        p5_pos = pos[:, p5_start:]
+        p5_key_padding = key_padding_mask[:, p5_start:]
+        
+        # Apply standard self-attention to P5
+        p5_q = p5_k = self.with_pos_embed(p5_src.transpose(0, 1), p5_pos.transpose(0, 1))
+        p5_attn_src = self.std_self_attn(p5_q, p5_k, p5_src.transpose(0, 1), 
+                                        key_padding_mask=p5_key_padding)[0].transpose(0, 1)
+        p5_src = p5_src + self.dropout_std(p5_attn_src)
+        p5_src = self.norm_std(p5_src)
+        
+        # Replace P5 in splits
+        # bs x (p1 + p2 + p3) x d_model -> bs x (p1 + p2 + p3 + p4) x d_model
+        src = torch.cat((src[:, :p5_start], p5_src), dim=1)
+        
+        # Apply deformable attention to all scales
+        src2 = self.self_attn(self.with_pos_embed(src, pos), reference_points, src, 
+                             spatial_shapes, level_start_index, key_padding_mask)
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+
+        # FFN
+        src = self.forward_ffn(src)
+
+        # Channel attention if enabled
+        if self.add_channel_attention:
+            src = self.norm_channel(src + self.activ_channel(src))
+
+        return src

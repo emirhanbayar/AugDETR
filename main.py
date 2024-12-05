@@ -47,7 +47,7 @@ def get_args_parser():
                         help='add some notes to the experiment')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
-    parser.add_argument('--seed', default=42, type=int)
+    parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--pretrain_model_path', help='load from other checkpoint')
     parser.add_argument('--finetune_ignore', type=str, nargs='+')
@@ -71,6 +71,10 @@ def get_args_parser():
     parser.add_argument("--local_rank", type=int, help='local rank for DistributedDataParallel')
     parser.add_argument('--amp', action='store_true',
                         help="Train with mixed precision")
+    
+    # HAE parameters
+    parser.add_argument('--use_hae', action='store_true')
+    parser.add_argument('--num_hybrid_layers', default=2, type=int)
     
     return parser
 
@@ -210,6 +214,8 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
+        print("Resume from checkpoint: {}".format(args.resume))
+        print(checkpoint.keys())
         model_without_ddp.load_state_dict(checkpoint['model'])
         if args.use_ema:
             if 'ema_model' in checkpoint:
