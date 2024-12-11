@@ -473,49 +473,46 @@ def save_on_master(*args, **kwargs):
 
 
 def init_distributed_mode(args):
-    if 'WORLD_SIZE' in os.environ and os.environ['WORLD_SIZE'] != '': # 'RANK' in os.environ and 
-        # args.rank = int(os.environ["RANK"])
-        # args.world_size = int(os.environ['WORLD_SIZE'])
-        # args.gpu = args.local_rank = int(os.environ['LOCAL_RANK'])
-
-        # launch by torch.distributed.launch
-        # Single node
-        #   python -m torch.distributed.launch --nproc_per_node=8 main.py --world-size 1 --rank 0 ...
-        # Multi nodes
-        #   python -m torch.distributed.launch --nproc_per_node=8 main.py --world-size 2 --rank 0 --dist-url 'tcp://IP_OF_NODE0:FREEPORT' ...
-        #   python -m torch.distributed.launch --nproc_per_node=8 main.py --world-size 2 --rank 1 --dist-url 'tcp://IP_OF_NODE0:FREEPORT' ...
-
-        local_world_size = int(os.environ['WORLD_SIZE'])
-        args.world_size = args.world_size * local_world_size
-        args.gpu = args.local_rank = int(os.environ['LOCAL_RANK'])
-        args.rank = args.rank * local_world_size + args.local_rank
-        print('world size: {}, rank: {}, local rank: {}'.format(args.world_size, args.rank, args.local_rank))
-        print(json.dumps(dict(os.environ), indent=2))
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.gpu = int(os.environ['LOCAL_RANK'])
     elif 'SLURM_PROCID' in os.environ:
         args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.local_rank = int(os.environ['SLURM_LOCALID'])
-        args.world_size = int(os.environ['SLURM_NPROCS'])
+        args.gpu = args.rank % torch.cuda.device_count() if torch.cuda.device_count() > 0 else args.rank
 
-        print('world size: {}, world rank: {}, local rank: {}, device_count: {}'.format(args.world_size, args.rank, args.local_rank, torch.cuda.device_count()))
-    else:
-        print('Not using distributed mode')
-        args.distributed = False
-        args.world_size = 1
-        args.rank = 0
-        args.local_rank = 0
+    # Print debug information
+    print(f"world size: {args.world_size}, world rank: {args.rank}, local rank: {args.gpu}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"CUDA device count: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        print(f"CUDA current device: {torch.cuda.current_device()}")
+        print(f"CUDA device properties: {torch.cuda.get_device_properties(0)}")
+    
+    # Check CUDA environment variables
+    cuda_vars = ['CUDA_VISIBLE_DEVICES', 'CUDA_HOME', 'LD_LIBRARY_PATH']
+    for var in cuda_vars:
+        print(f"{var}: {os.environ.get(var, 'Not set')}")
+
+    if not torch.cuda.is_available():
+        print('No CUDA available. Check if CUDA is properly set up on the compute node.')
         return
 
-    print("world_size:{} rank:{} local_rank:{}".format(args.world_size, args.rank, args.local_rank))
+    try:
+        torch.cuda.set_device(args.gpu)
+    except Exception as e:
+        print(f"Error setting CUDA device: {e}")
+        print("Available CUDA devices:", torch.cuda.device_count())
+        return
+
     args.distributed = True
-    torch.cuda.set_device(args.local_rank)
-    args.dist_backend = 'nccl'
-    print('| distributed init (rank {}): {}'.format(args.rank, args.dist_url), flush=True)
-    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                         world_size=args.world_size, rank=args.rank)
-    print("Before torch.distributed.barrier()")
+
+    torch.distributed.init_process_group(
+        backend='nccl',
+        init_method=args.dist_url,
+        world_size=args.world_size,
+        rank=args.rank)
     torch.distributed.barrier()
-    print("End torch.distributed.barrier()")
-    setup_for_distributed(args.rank == 0)
 
 
 @torch.no_grad()
