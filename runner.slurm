@@ -12,7 +12,7 @@ echo "=== Starting Job ==="
 # Set up environment variables with correct CUDA paths
 ls -la /usr/local/
 
-export CUDA_HOME=/usr/local/cuda-10.0
+export CUDA_HOME=/usr/local/cuda
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
@@ -26,23 +26,7 @@ echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 # Setup conda
 source /home/ebayar/anaconda3/etc/profile.d/conda.sh
 
-# Remove existing environment if it exists
-#conda deactivate
-#conda env remove -n deneme -y
-
-# Create a new conda environment with Python 3.8 and GCC 7
-echo "=== Creating Conda Environment ==="
-#conda create -n deneme python=3.8 -y
-conda activate deneme
-
-# Install GCC 7 through conda
-#conda install -y gxx_linux-64=7.3.0
-
-# Set environment variables for the compilers
-export CC=$(find $CONDA_PREFIX/bin -name "x86_64-conda_cos6-linux-gnu-gcc")
-export CXX=$(find $CONDA_PREFIX/bin -name "x86_64-conda_cos6-linux-gnu-g++")
-echo "CC: $CC"
-echo "CXX: $CXX"
+conda activate dl4
 
 # Print Python and pip paths
 echo "=== Python Environment ==="
@@ -52,22 +36,12 @@ which python
 python --version
 pip --version
 
-# Install PyTorch with CUDA 10.0/10.1 compatibility
-echo "=== Installing PyTorch ==="
-pip install torch==1.7.1+cu101 torchvision==0.8.2+cu101 -f https://download.pytorch.org/whl/torch_stable.html
-
 # Verify PyTorch installation
 echo "=== PyTorch Information ==="
 python -c "import torch; print('PyTorch Version:', torch.__version__); print('CUDA Available:', torch.cuda.is_available()); print('CUDA Version:', torch.version.cuda); print('GPU Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')"
 
-# Install other requirements
-echo "=== Installing Requirements ==="
-pip install -r requirements.txt
-
 # Set CUDA architecture flags for compilation
-# GTX 1080 has compute capability 6.1
-export TORCH_CUDA_ARCH_LIST="6.1"
-export FORCE_CUDA=1
+export TORCH_CUDA_ARCH_LIST="8.6"
 
 # Clean previous builds if they exist
 echo "=== Cleaning Previous Builds ==="
@@ -79,6 +53,7 @@ pip install ninja
 # Build CUDA extensions with verbose output
 echo "=== Building CUDA Extensions ==="
 cd models/dino/ops/
+pwd
 
 # Create a temporary setup config to force use of conda compilers
 cat > setup.cfg << EOL
