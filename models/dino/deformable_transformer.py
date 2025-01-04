@@ -112,7 +112,9 @@ class DeformableTransformer(nn.Module):
                                                           dropout, activation,
                                                           num_feature_levels, nhead, enc_n_points, add_channel_attention=add_channel_attention, use_deformable_box_attn=use_deformable_box_attn, box_attn_type=box_attn_type)
             if use_hae:
-                hybrid_encoder_layer = HybridAttentionEncoderLayer(d_model, dim_feedforward,)
+                hybrid_encoder_layer = HybridAttentionEncoderLayer(d_model, dim_feedforward,
+                                                                   dropout, activation,
+                                                                   num_feature_levels, nhead, enc_n_points, add_channel_attention=add_channel_attention, use_deformable_box_attn=use_deformable_box_attn, box_attn_type=box_attn_type)
             else:
                 hybrid_encoder_layer = None
         else:
@@ -1115,6 +1117,8 @@ class HybridAttentionEncoderLayer(DeformableTransformerEncoderLayer):
                                         key_padding_mask=p5_key_padding)[0].transpose(0, 1)
         p5_src = p5_src + self.dropout_std(p5_attn_src)
         p5_src = self.norm_std(p5_src)
+
+        p5_src = self.forward_ffn(p5_src)
         
         # Replace P5 in splits
         # bs x (p1 + p2 + p3) x d_model -> bs x (p1 + p2 + p3 + p4) x d_model
