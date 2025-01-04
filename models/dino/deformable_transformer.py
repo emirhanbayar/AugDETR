@@ -1104,6 +1104,20 @@ class HybridAttentionEncoderLayer(DeformableTransformerEncoderLayer):
         self.dropout_std = nn.Dropout(dropout)
         self.norm_std = nn.LayerNorm(d_model)
 
+        # ffn after standard self-attention
+        self.linear1_std = nn.Linear(d_model, d_ffn)
+        self.activation_std = _get_activation_fn(activation, d_model=d_ffn)
+        self.dropout2_std = nn.Dropout(dropout)
+        self.linear2_std = nn.Linear(d_ffn, d_model)
+        self.dropout3_std = nn.Dropout(dropout)
+        self.norm2_std = nn.LayerNorm(d_model)
+
+    def forward_ffn_std(self, src):
+        src2 = self.linear2_std(self.dropout2_std(self.activation_std(self.linear1_std(src))))
+        src = src + self.dropout3_std(src2)
+        src = self.norm2_std(src)
+        return src
+
     def forward(self, src, pos, reference_points, spatial_shapes, level_start_index, key_padding_mask=None):
 
         p5_start = level_start_index[-1]
