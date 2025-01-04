@@ -1132,7 +1132,7 @@ class HybridAttentionEncoderLayer(DeformableTransformerEncoderLayer):
         p5_src = p5_src + self.dropout_std(p5_attn_src)
         p5_src = self.norm_std(p5_src)
 
-        p5_src = self.forward_ffn(p5_src)
+        p5_src = self.forward_ffn_std(p5_src)
         
         # Replace P5 in splits
         # bs x (p1 + p2 + p3) x d_model -> bs x (p1 + p2 + p3 + p4) x d_model
