@@ -1288,7 +1288,7 @@ class EncoderMixingDeformableTransformerDecoderLayer(DeformableTransformerDecode
             # Apply cross attention for current encoder layer
             layer_output = self.cross_attn(
                 q.transpose(0, 1),                            # [bs, nq, d_model]
-                tgt_reference_points.transpose(0, 1),  # [bs, nq, 4]
+                tgt_reference_points.transpose(0, 1).contiguous(),  # [bs, nq, 4]
                 enc_output,                                    # [bs, hw, d_model]
                 memory_spatial_shapes,
                 memory_level_start_index,
