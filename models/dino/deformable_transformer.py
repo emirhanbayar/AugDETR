@@ -456,15 +456,33 @@ class DeformableTransformer(nn.Module):
         #########################################################
         # Begin Decoder
         #########################################################
-        hs, references = self.decoder(
-                tgt=tgt.transpose(0, 1), 
-                memory=memory.transpose(0, 1), 
-                memory_key_padding_mask=mask_flatten, 
+        if self.use_emca:
+            # Pass all encoder outputs to decoder
+            hs, references = self.decoder(
+                tgt=tgt.transpose(0, 1),
+                memory=enc_intermediate_output,  # Pass all encoder outputs
+                memory_key_padding_mask=mask_flatten,
                 pos=lvl_pos_embed_flatten.transpose(0, 1),
-                refpoints_unsigmoid=refpoint_embed.transpose(0, 1), 
-                level_start_index=level_start_index, 
+                refpoints_unsigmoid=refpoint_embed.transpose(0, 1),
+                level_start_index=level_start_index,
                 spatial_shapes=spatial_shapes,
-                valid_ratios=valid_ratios,tgt_mask=attn_mask)
+                valid_ratios=valid_ratios,
+                tgt_mask=attn_mask
+            )
+        else:
+            # Original non-EMCA forward path            
+            hs, references = self.decoder(
+                tgt=tgt.transpose(0, 1),
+                memory=memory.transpose(0, 1),
+                memory_key_padding_mask=mask_flatten,
+                pos=lvl_pos_embed_flatten.transpose(0, 1),
+                refpoints_unsigmoid=refpoint_embed.transpose(0, 1),
+                level_start_index=level_start_index,
+                spatial_shapes=spatial_shapes,
+                valid_ratios=valid_ratios,
+                tgt_mask=attn_mask
+            )
+
         #########################################################
         # End Decoder
         # hs: n_dec, bs, nq, d_model
@@ -515,7 +533,7 @@ class TransformerEncoder(nn.Module):
         if num_layers > 0:
             if hybrid_encoder_layer is not None:
                 self.layers = _get_clones(hybrid_encoder_layer, num_hybrid_layers)
-                assert num_layers > num_hybrid_layers
+                assert num_layers >= num_hybrid_layers
                 self.layers += _get_clones(encoder_layer, num_layers - num_hybrid_layers, layer_share=enc_layer_share)
             else:
                 self.layers = _get_clones(encoder_layer, num_layers, layer_share=enc_layer_share)
@@ -1213,17 +1231,115 @@ class HybridAttentionEncoderLayer(DeformableTransformerEncoderLayer):
 
 class EncoderMixingDeformableTransformerDecoderLayer(DeformableTransformerDecoderLayer):
     def __init__(self, d_model=256, d_ffn=1024,
-                    dropout=0.1, activation="relu",
-                    n_levels=4, n_heads=8, n_points=4,
-                    use_deformable_box_attn=False,
-                    box_attn_type='roi_align',
-                    key_aware_type=None,
-                    decoder_sa_type='ca',
-                    module_seq=['sa', 'ca', 'ffn'],
-                    mixing_ratio=0.5,
-                    ):
-            super().__init__(d_model, d_ffn, dropout, activation, 
-                            n_levels, n_heads, n_points, use_deformable_box_attn, 
-                            box_attn_type, key_aware_type, decoder_sa_type, module_seq)
+                 dropout=0.1, activation="relu",
+                 n_levels=4, n_heads=8, n_points=4,
+                 use_deformable_box_attn=False,
+                 box_attn_type='roi_align',
+                 key_aware_type=None,
+                 decoder_sa_type='ca',
+                 module_seq=['sa', 'ca', 'ffn']):
+        super().__init__(d_model, d_ffn, dropout, activation,
+                        n_levels, n_heads, n_points, use_deformable_box_attn,
+                        box_attn_type, key_aware_type, decoder_sa_type, module_seq)
+        
+        # Initialize weights for encoder mixing
+        self.encoder_mixing_weights = nn.Linear(d_model, 6)  # 6 encoder layers
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward_ca(self,
+                  tgt,                       # nq, bs, d_model
+                  tgt_query_pos,             # pos for query. MLP(Sine(pos))
+                  tgt_query_sine_embed,      # pos for query. Sine(pos)
+                  tgt_key_padding_mask,
+                  tgt_reference_points,      # nq, bs, 4
+                  memory,                    # list of tensors from encoder
+                  memory_key_padding_mask,
+                  memory_level_start_index,  # num_levels
+                  memory_spatial_shapes,     # bs, num_levels, 2
+                  memory_pos,                # pos for memory
+                  self_attn_mask=None,
+                  cross_attn_mask=None):
+        
+        # Apply key-aware processing if specified
+        if self.key_aware_type is not None:
+            if self.key_aware_type == 'mean':
+                tgt = tgt + memory[-1].mean(0, keepdim=True)  # Use last encoder layer for key-aware
+            elif self.key_aware_type == 'proj_mean':
+                tgt = tgt + self.key_aware_proj(memory[-1]).mean(0, keepdim=True)
+            else:
+                raise NotImplementedError(f"Unknown key_aware_type: {self.key_aware_type}")
+        
+        # Generate mixing weights based on query features
+        # [nq, bs, d_model] -> [nq, bs, 6]
+        mixing_weights = self.sigmoid(self.encoder_mixing_weights(tgt))
+        
+        # Initialize output
+        final_output = 0
+        
+        # Get query with position embeddings
+        q = self.with_pos_embed(tgt, tgt_query_pos)  # [nq, bs, d_model]
             
-            # TODO: Implement Encoder Mixing Cross Attention
+        # Process each encoder layer
+        for layer_idx, enc_output in enumerate(memory):
+            # Ensure memory has correct shape [bs, hw, d_model]
+            if enc_output.shape[1] != memory_key_padding_mask.shape[1]:
+                enc_output = enc_output.permute(1, 0, 2)
+                
+            # Apply cross attention for current encoder layer
+            layer_output = self.cross_attn(
+                q.transpose(0, 1),                            # [bs, nq, d_model]
+                tgt_reference_points.transpose(0, 1),  # [bs, nq, 4]
+                enc_output,                                    # [bs, hw, d_model]
+                memory_spatial_shapes,
+                memory_level_start_index,
+                memory_key_padding_mask
+            ).transpose(0, 1)                                # back to [nq, bs, d_model]
+            
+            # Apply mixing weight for current layer
+            layer_weight = mixing_weights[:, :, layer_idx:layer_idx+1]
+            final_output = final_output + layer_weight * layer_output
+        
+        # Apply dropout and layer norm
+        tgt = tgt + self.dropout1(final_output)
+        tgt = self.norm1(tgt)
+        
+        return tgt
+
+    def forward(self,
+                tgt,                        # nq, bs, d_model
+                tgt_query_pos=None,         # pos for query. MLP(Sine(pos))
+                tgt_query_sine_embed=None,  # pos for query. Sine(pos)
+                tgt_key_padding_mask=None,
+                tgt_reference_points=None,  # nq, bs, 4
+                memory=None,               # list of encoder outputs
+                memory_key_padding_mask=None,
+                memory_level_start_index=None,  # num_levels
+                memory_spatial_shapes=None,     # bs, num_levels, 2
+                memory_pos=None,               # pos for memory
+                self_attn_mask=None,
+                cross_attn_mask=None):
+        
+        # Process modules in specified sequence
+        for funcname in self.module_seq:
+            if funcname == 'ffn':
+                tgt = self.forward_ffn(tgt)
+            elif funcname == 'ca':
+                tgt = self.forward_ca(
+                    tgt, tgt_query_pos, tgt_query_sine_embed,
+                    tgt_key_padding_mask, tgt_reference_points,
+                    memory, memory_key_padding_mask, memory_level_start_index,
+                    memory_spatial_shapes, memory_pos,
+                    self_attn_mask, cross_attn_mask
+                )
+            elif funcname == 'sa':
+                tgt = self.forward_sa(
+                    tgt, tgt_query_pos, tgt_query_sine_embed,
+                    tgt_key_padding_mask, tgt_reference_points,
+                    memory[-1], memory_key_padding_mask, memory_level_start_index,
+                    memory_spatial_shapes, memory_pos,
+                    self_attn_mask, cross_attn_mask
+                )
+            else:
+                raise ValueError(f'Unknown funcname {funcname}')
+        
+        return tgt
