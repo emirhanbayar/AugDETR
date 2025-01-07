@@ -275,6 +275,105 @@ class DeformableTransformer(nn.Module):
             self.refpoint_embed.weight.data[:, :2] = inverse_sigmoid(self.refpoint_embed.weight.data[:, :2])
             self.refpoint_embed.weight.data[:, :2].requires_grad = False
 
+    def prepare_two_stage_outputs(self, memory, mask_flatten, spatial_shapes, bs, refpoint_embed=None, tgt=None):
+            """
+            Prepare outputs for two-stage processing.
+            
+            Args:
+                memory: Output from encoder
+                mask_flatten: Flattened attention mask
+                spatial_shapes: Spatial shapes of feature maps
+                bs: Batch size
+                refpoint_embed: Reference point embeddings (optional)
+                tgt: Target embeddings (optional)
+                
+            Returns:
+                tuple: (refpoint_embed, tgt, init_box_proposal, 
+                    enc_outputs_class_unselected, enc_outputs_coord_unselected, 
+                    output_proposals, output_memory, tgt_undetach, refpoint_embed_undetach)
+            """
+            output_memory = None
+            output_proposals = None
+            enc_outputs_class_unselected = None
+            enc_outputs_coord_unselected = None
+            tgt_undetach = None
+            refpoint_embed_undetach = None
+            init_box_proposal = None
+
+            if self.two_stage_type == 'standard':
+                if self.two_stage_learn_wh:
+                    input_hw = self.two_stage_wh_embedding.weight[0]
+                else:
+                    input_hw = None
+
+                # Generate encoder output proposals
+                output_memory, output_proposals = gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes, input_hw)
+                output_memory = self.enc_output_norm(self.enc_output(output_memory))
+                
+                if self.two_stage_pat_embed > 0:
+                    bs, nhw, _ = output_memory.shape
+                    # output_memory: bs, n, 256; self.pat_embed_for_2stage: k, 256
+                    output_memory = output_memory.repeat(1, self.two_stage_pat_embed, 1)
+                    _pats = self.pat_embed_for_2stage.repeat_interleave(nhw, 0) 
+                    output_memory = output_memory + _pats
+                    output_proposals = output_proposals.repeat(1, self.two_stage_pat_embed, 1)
+
+                if self.two_stage_add_query_num > 0:
+                    assert refpoint_embed is not None
+                    output_memory = torch.cat((output_memory, tgt), dim=1)
+                    output_proposals = torch.cat((output_proposals, refpoint_embed), dim=1)
+
+                # Generate class and coordinate predictions
+                enc_outputs_class_unselected = self.enc_out_class_embed(output_memory)
+                enc_outputs_coord_unselected = self.enc_out_bbox_embed(output_memory) + output_proposals # (bs, \sum{hw}, 4) unsigmoid
+                
+                # Select top-k proposals
+                topk = self.num_queries
+                topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1] # bs, nq
+
+                # Gather boxes
+                refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)) # unsigmoid
+                refpoint_embed_ = refpoint_embed_undetach.detach()
+                init_box_proposal = torch.gather(output_proposals, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)).sigmoid() # sigmoid
+
+                # Gather tgt
+                tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))
+                if self.embed_init_tgt:
+                    tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, d_model
+                else:
+                    tgt_ = tgt_undetach.detach()
+
+                if refpoint_embed is not None:
+                    refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_], dim=1)
+                    tgt = torch.cat([tgt, tgt_], dim=1)
+                else:
+                    refpoint_embed, tgt = refpoint_embed_, tgt_
+
+            elif self.two_stage_type == 'no':
+                tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, d_model
+                refpoint_embed_ = self.refpoint_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, 4
+                
+                if refpoint_embed is not None:
+                    refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_], dim=1)
+                    tgt = torch.cat([tgt, tgt_], dim=1)
+                else:
+                    refpoint_embed, tgt = refpoint_embed_, tgt_
+
+                if self.num_patterns > 0:
+                    tgt_embed = tgt.repeat(1, self.num_patterns, 1)
+                    refpoint_embed = refpoint_embed.repeat(1, self.num_patterns, 1)
+                    tgt_pat = self.patterns.weight[None, :, :].repeat_interleave(self.num_queries, 1) # 1, n_q*n_pat, d_model
+                    tgt = tgt_embed + tgt_pat
+
+                init_box_proposal = refpoint_embed_.sigmoid()
+
+            else:
+                raise NotImplementedError(f"unknown two_stage_type {self.two_stage_type}")
+                
+            return (refpoint_embed, tgt, init_box_proposal, 
+                    enc_outputs_class_unselected, enc_outputs_coord_unselected,
+                    output_proposals, output_memory, tgt_undetach, refpoint_embed_undetach)
+
     def forward(self, srcs, masks, refpoint_embed, pos_embeds, tgt, attn_mask=None):
         """
         Input:
@@ -337,74 +436,17 @@ class DeformableTransformer(nn.Module):
         # - enc_intermediate_refpoints: None or (nenc+1, bs, nq, c) or (nenc, bs, nq, c)
         #########################################################
 
-        if enc_intermediate_output and self.use_emca:
-            # TODO: if use emca calculate the reference points for each intermediate output
-            pass
-        else:
-            if self.two_stage_type =='standard':
-                if self.two_stage_learn_wh:
-                    input_hw = self.two_stage_wh_embedding.weight[0]
-                else:
-                    input_hw = None
-                output_memory, output_proposals = gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes, input_hw)
-                output_memory = self.enc_output_norm(self.enc_output(output_memory))
-                
-                if self.two_stage_pat_embed > 0:
-                    bs, nhw, _ = output_memory.shape
-                    # output_memory: bs, n, 256; self.pat_embed_for_2stage: k, 256
-                    output_memory = output_memory.repeat(1, self.two_stage_pat_embed, 1)
-                    _pats = self.pat_embed_for_2stage.repeat_interleave(nhw, 0) 
-                    output_memory = output_memory + _pats
-                    output_proposals = output_proposals.repeat(1, self.two_stage_pat_embed, 1)
+        (refpoint_embed, tgt, init_box_proposal,
+         enc_outputs_class_unselected, enc_outputs_coord_unselected,
+         output_proposals, output_memory, tgt_undetach, refpoint_embed_undetach) = self.prepare_two_stage_outputs(
+            memory=memory,
+            mask_flatten=mask_flatten,
+            spatial_shapes=spatial_shapes,
+            bs=srcs[0].shape[0],  # Get batch size from first source tensor
+            refpoint_embed=refpoint_embed,
+            tgt=tgt
+        )
 
-                if self.two_stage_add_query_num > 0:
-                    assert refpoint_embed is not None
-                    output_memory = torch.cat((output_memory, tgt), dim=1)
-                    output_proposals = torch.cat((output_proposals, refpoint_embed), dim=1)
-
-                enc_outputs_class_unselected = self.enc_out_class_embed(output_memory)
-                enc_outputs_coord_unselected = self.enc_out_bbox_embed(output_memory) + output_proposals # (bs, \sum{hw}, 4) unsigmoid
-                topk = self.num_queries
-                topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1] # bs, nq
-
-                # gather boxes
-                refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)) # unsigmoid
-                refpoint_embed_ = refpoint_embed_undetach.detach()
-                init_box_proposal = torch.gather(output_proposals, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)).sigmoid() # sigmoid
-
-                # gather tgt
-                tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))
-                if self.embed_init_tgt:
-                    tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, d_model
-                else:
-                    tgt_ = tgt_undetach.detach()
-
-                if refpoint_embed is not None:
-                    refpoint_embed=torch.cat([refpoint_embed,refpoint_embed_],dim=1)
-                    tgt=torch.cat([tgt,tgt_],dim=1)
-                else:
-                    refpoint_embed,tgt=refpoint_embed_,tgt_
-
-            elif self.two_stage_type == 'no':
-                tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, d_model
-                refpoint_embed_ = self.refpoint_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, 4
-
-                if refpoint_embed is not None:
-                    refpoint_embed=torch.cat([refpoint_embed,refpoint_embed_],dim=1)
-                    tgt=torch.cat([tgt,tgt_],dim=1)
-                else:
-                    refpoint_embed,tgt=refpoint_embed_,tgt_
-
-                if self.num_patterns > 0:
-                    tgt_embed = tgt.repeat(1, self.num_patterns, 1)
-                    refpoint_embed = refpoint_embed.repeat(1, self.num_patterns, 1)
-                    tgt_pat = self.patterns.weight[None, :, :].repeat_interleave(self.num_queries, 1) # 1, n_q*n_pat, d_model
-                    tgt = tgt_embed + tgt_pat
-
-                init_box_proposal = refpoint_embed_.sigmoid()
-
-            else:
-                raise NotImplementedError("unknown two_stage_type {}".format(self.two_stage_type))
         #########################################################
         # End preparing tgt
         # - tgt: bs, NQ, d_model
